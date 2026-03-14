@@ -67,7 +67,7 @@ BRIGHTNESS_LEVELS = [1, 2]
 BRIGHTNESS_VALUES = [hex(val) for val in BRIGHTNESS_LEVELS]
 
 # Long-press / swipe detection (for top-left/right icons)
-LONG_PRESS_SECONDS = 0.7
+LONG_PRESS_SECONDS = 0.35
 SWIPE_THRESHOLD_RATIO = 0.1  # fraction of touchpad dimension
 
 # Device identification patterns
