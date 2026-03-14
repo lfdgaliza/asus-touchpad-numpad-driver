@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import logging
 import math
 import os
@@ -8,7 +9,8 @@ import shutil
 import subprocess
 import sys
 from fcntl import F_SETFL, fcntl
-from time import sleep
+from time import sleep, time
+from typing import Optional
 
 from libevdev import EV_ABS, EV_KEY, EV_SYN, Device, InputEvent
 
@@ -59,9 +61,13 @@ NUMPAD_KEYS = [
     [EV_KEY.KEY_KP0, EV_KEY.KEY_KPDOT, EV_KEY.KEY_KPENTER, EV_KEY.KEY_KPPLUS, EV_KEY.KEY_KPEQUAL]
 ]
 
-# Brightness levels (single level for UX3405MA)
-BRIGHTNESS_LEVELS = [1]
+# Brightness levels (two levels for ASUS NumberPad LED)
+BRIGHTNESS_LEVELS = [1, 2]
 BRIGHTNESS_VALUES = [hex(val) for val in BRIGHTNESS_LEVELS]
+
+# Long-press / swipe detection (for top-left/right icons)
+LONG_PRESS_SECONDS = 0.7
+SWIPE_THRESHOLD_RATIO = 0.1  # fraction of touchpad dimension
 
 # Device identification patterns
 # NOTE: touchpad name can vary between models (ASUP/ASUE/ELAN etc.)
@@ -278,6 +284,15 @@ def deactivate_numlock():
 
 
 def launch_calculator():
+    # Try to open a calculator app if available; fall back to the KEY_CALC keycode.
+    for cmd in ("gnome-calculator", "kcalc", "galculator", "xcalc"):
+        if shutil.which(cmd):
+            try:
+                subprocess.Popen([cmd])
+                return
+            except OSError:
+                continue
+
     try:
         events = [
             InputEvent(calculator_key, 1),
@@ -286,7 +301,7 @@ def launch_calculator():
             InputEvent(EV_SYN.SYN_REPORT, 0)
         ]
         udev.send_events(events)
-    except OSError as e:
+    except OSError:
         pass
 
 
@@ -304,117 +319,132 @@ def change_brightness(brightness):
 
 # Run - process and act on events
 
+
 numlock: bool = False
 pos_x: int = 0
 pos_y: int = 0
 button_pressed = None  # type: Optional[int]
 brightness: int = 0
 
+# Touch handling state (for long-press / swipe gestures)
+touch_start_time = 0.0
+touch_start_x = 0
+touch_start_y = 0
+touch_area = None  # 'numlock' | 'top_left' | None
+numlock_longpress_triggered = False
+top_left_longpress_triggered = False
+
 while True:
-    # If touchpad sends tap events, convert x/y position to numlock key and send it #
+    # Process all available events
     for e in d_t.events():
-
-        # ignore others events, except position and finger events
-        if not (
-            e.matches(EV_ABS.ABS_MT_POSITION_X) or
-            e.matches(EV_ABS.ABS_MT_POSITION_Y) or
-            e.matches(EV_KEY.BTN_TOOL_FINGER)
-        ):
-            continue
-
-        # Get x position #
+        # ...existing code...
         if e.matches(EV_ABS.ABS_MT_POSITION_X):
             x = e.value
             continue
-
-        # Get y position #
         if e.matches(EV_ABS.ABS_MT_POSITION_Y):
             y = e.value
             continue
-
-        # Else event is tap: e.matches(EV_KEY.BTN_TOOL_FINGER) #
-
-        # If end of tap, send release key event #
-        if e.value == 0:
-            log.debug('finger up at x %d y %d', x, y)
-
-            if button_pressed:
-                log.debug('send key up event %s', button_pressed)
-                events = [
-                    InputEvent(EV_KEY.KEY_LEFTSHIFT, 0),
-                    InputEvent(button_pressed, 0),
-                    InputEvent(EV_SYN.SYN_REPORT, 0)
-                ]
+        # ...existing code for BTN_TOOL_FINGER...
+        if e.matches(EV_KEY.BTN_TOOL_FINGER):
+            if e.value == 1 and not button_pressed:
+                # ...existing code for finger down...
+                log.debug('finger down at x %d y %d', x, y)
+                if x < 0 or x > maxx or y < 0 or y > maxy:
+                    log.debug('Coordinates out of range: x=%d y=%d (max: %d,%d)', x, y, maxx, maxy)
+                    continue
+                if (x > 0.95 * maxx) and (y < 0.09 * maxy):
+                    touch_area = 'numlock'
+                    touch_start_time = time()
+                    touch_start_x, touch_start_y = x, y
+                    numlock_longpress_triggered = False
+                    continue
+                elif (x < 0.06 * maxx) and (y < 0.07 * maxy):
+                    touch_area = 'top_left'
+                    touch_start_time = time()
+                    touch_start_x, touch_start_y = x, y
+                    top_left_longpress_triggered = False
+                    continue
+                if not numlock:
+                    continue
+                col = int(NUMPAD_COLS * x * maxx_reciprocal)
+                row = int((NUMPAD_ROWS * y * maxy_reciprocal) - TOP_OFFSET_RATIO)
+                if row < 0:
+                    continue
+                try:
+                    button_pressed = NUMPAD_KEYS[row][col]
+                except IndexError:
+                    log.debug('Unhandled col/row %d/%d for position %d-%d', col, row, x, y)
+                    continue
+                if button_pressed == EV_KEY.KEY_5:
+                    button_pressed = percentage_key
+                log.debug('send press key event %s', button_pressed)
+                if button_pressed == percentage_key:
+                    events = [
+                        InputEvent(EV_KEY.KEY_LEFTSHIFT, 1),
+                        InputEvent(button_pressed, 1),
+                        InputEvent(EV_SYN.SYN_REPORT, 0)
+                    ]
+                else:
+                    events = [
+                        InputEvent(button_pressed, 1),
+                        InputEvent(EV_SYN.SYN_REPORT, 0)
+                    ]
                 try:
                     udev.send_events(events)
-                    button_pressed = None
                 except OSError as err:
-                    log.error("Cannot send release event, %s", err)
-                    pass
+                    log.warning("Cannot send press event, %s", err)
+            elif e.value == 0:
+                log.debug('finger up at x %d y %d', x, y)
+                if touch_area == 'numlock':
+                    touch_area = None
+                elif touch_area == 'top_left':
+                    duration = time() - touch_start_time
+                    dx = abs(x - touch_start_x)
+                    dy = abs(y - touch_start_y)
+                    dist = max(dx / maxx, dy / maxy)
+                    if not top_left_longpress_triggered:
+                        if duration >= LONG_PRESS_SECONDS or dist >= SWIPE_THRESHOLD_RATIO:
+                            launch_calculator()
+                        else:
+                            if numlock:
+                                brightness = change_brightness(brightness)
+                            else:
+                                launch_calculator()
+                    touch_area = None
+                if button_pressed:
+                    log.debug('send key up event %s', button_pressed)
+                    events = [
+                        InputEvent(EV_KEY.KEY_LEFTSHIFT, 0),
+                        InputEvent(button_pressed, 0),
+                        InputEvent(EV_SYN.SYN_REPORT, 0)
+                    ]
+                    try:
+                        udev.send_events(events)
+                        button_pressed = None
+                    except OSError as err:
+                        log.error("Cannot send release event, %s", err)
+                        pass
 
-        elif e.value == 1 and not button_pressed:
-            # Start of tap #
-            log.debug('finger down at x %d y %d', x, y)
 
-            # Validate coordinates are within expected range
-            if x < 0 or x > maxx or y < 0 or y > maxy:
-                log.debug('Coordinates out of range: x=%d y=%d (max: %d,%d)', x, y, maxx, maxy)
-                continue
-
-            # Check if numlock was hit #
-            if (x > 0.95 * maxx) and (y < 0.09 * maxy):
-                numlock = not numlock
-                if numlock:
-                    activate_numlock(brightness)
-                else:
-                    deactivate_numlock()
-                continue
-
-            # Check if caclulator was hit #
-            elif (x < 0.06 * maxx) and (y < 0.07 * maxy):
-                if numlock:
-                    brightness = change_brightness(brightness)
-                else:
-                    launch_calculator()
-                continue
-
-            # If touchpad mode, ignore #
-            if not numlock:
-                continue
-
-            # else numpad mode is activated
-            col = int(NUMPAD_COLS * x * maxx_reciprocal)  # Optimized division
-            row = int((NUMPAD_ROWS * y * maxy_reciprocal) - TOP_OFFSET_RATIO)  # Optimized division
-            # Ignore top_offset region #
-            if row < 0:
-                continue
-            try:
-                button_pressed = NUMPAD_KEYS[row][col]
-            except IndexError:
-                # skip invalid row and col values
-                log.debug('Unhandled col/row %d/%d for position %d-%d', col, row, x, y)
-                continue
-            
-            if button_pressed == EV_KEY.KEY_5:
-                button_pressed = percentage_key
-
-            # Send press key event #
-            log.debug('send press key event %s', button_pressed)
-
-            if button_pressed == percentage_key:
-                events = [
-                    InputEvent(EV_KEY.KEY_LEFTSHIFT, 1),
-                    InputEvent(button_pressed, 1),
-                    InputEvent(EV_SYN.SYN_REPORT, 0)
-                ]
+    # Poll for long-press in numlock area even if no new events
+    if touch_area == 'numlock' and not numlock_longpress_triggered:
+        duration = time() - touch_start_time
+        if duration >= LONG_PRESS_SECONDS:
+            numlock = not numlock
+            if numlock:
+                activate_numlock(brightness)
             else:
-                events = [
-                    InputEvent(button_pressed, 1),
-                    InputEvent(EV_SYN.SYN_REPORT, 0)
-                ]
+                deactivate_numlock()
+            numlock_longpress_triggered = True
 
-            try:
-                udev.send_events(events)
-            except OSError as err:
-                log.warning("Cannot send press event, %s", err)
+    # Poll for long-press or swipe in top-left area even if no new events
+    if touch_area == 'top_left' and not top_left_longpress_triggered:
+        duration = time() - touch_start_time
+        dx = abs(x - touch_start_x)
+        dy = abs(y - touch_start_y)
+        dist = max(dx / maxx, dy / maxy)
+        if duration >= LONG_PRESS_SECONDS or dist >= SWIPE_THRESHOLD_RATIO:
+            launch_calculator()
+            top_left_longpress_triggered = True
+
     sleep(MAIN_LOOP_SLEEP)  # Optimized for responsiveness
