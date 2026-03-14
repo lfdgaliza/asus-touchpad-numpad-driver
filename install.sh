@@ -52,97 +52,45 @@ if [ "$touchpad_detected" = false ] ; then
     exit 1
 fi
 
+echo "Installing for ASUS Zenbook 14 UX3405MA (using UX3402ZA layout)"
+
+# Clean up any cache
 if [[ -d numpad_layouts/__pycache__ ]] ; then
     rm -rf numpad_layouts/__pycache__
 fi
 
-echo
-echo "Select models keypad layout:"
-PS3='Please enter your choice '
-options=($(ls numpad_layouts) "Quit")
-select opt in "${options[@]}"
-do
-    opt=${opt::-3}
-    case $opt in
-        "gx701" )
-            model=gx701
-            break
-            ;;
-        "m433ia")
-            model=m433ia
-            break
-            ;;
-        "ux433fa")
-            model=ux433fa
-            break
-            ;;
-        "ux581l" )
-            model=ux581l
-            break
-            ;;
-        "ux3402za" )
-            model=ux3402za
-            break
-            ;;
-        "Q")
-            exit 0
-            ;;
-        *)
-            echo "invalid option $REPLY";;
-    esac
-done
+echo "Installing ASUS touchpad numpad service..."
 
-echo
-echo "What is your keyboard layout?"
-PS3='Please enter your choice [1-3]: '
-options=("Qwerty" "Azerty" "Quit")
-select opt in "${options[@]}"
-do
-    case $opt in
-        "Qwerty")
-            percentage_key=6 # Number 5
-            break
-            ;;
-        "Azerty")
-            percentage_key=40 # Apostrophe key
-            break
-            ;;
-        "Quit")
-            exit 0
-            ;;
-        *) echo "invalid option $REPLY";;
-    esac
-done
+# Install service file
+cp asus_touchpad.service /etc/systemd/system/asus_touchpad_numpad.service
 
-
-echo "Add asus touchpad service in /etc/systemd/system/"
-cat asus_touchpad.service | LAYOUT=$model PERCENTAGE_KEY=$percentage_key envsubst '$LAYOUT $PERCENTAGE_KEY' > /etc/systemd/system/asus_touchpad_numpad.service
-
-mkdir -p /usr/share/asus_touchpad_numpad-driver/numpad_layouts
+# Create directories
+mkdir -p /usr/share/asus_touchpad_numpad-driver
 mkdir -p /var/log/asus_touchpad_numpad-driver
-install asus_touchpad.py /usr/share/asus_touchpad_numpad-driver/
-install -t /usr/share/asus_touchpad_numpad-driver/numpad_layouts numpad_layouts/*.py
 
+# Install main script
+install asus_touchpad.py /usr/share/asus_touchpad_numpad-driver/
+
+# Load i2c-dev module
 echo "i2c-dev" | tee /etc/modules-load.d/i2c-dev.conf >/dev/null
 
+# Enable and start service
 systemctl enable asus_touchpad_numpad
-
-if [[ $? != 0 ]]
-then
-	echo "Something gone wrong while enabling asus_touchpad_numpad.service"
-	exit 1
+if [[ $? != 0 ]]; then
+    echo "Failed to enable asus_touchpad_numpad.service"
+    exit 1
 else
-	echo "Asus touchpad service enabled"
+    echo "ASUS touchpad service enabled"
 fi
 
 systemctl restart asus_touchpad_numpad
-if [[ $? != 0 ]]
-then
-	echo "Something gone wrong while enabling asus_touchpad_numpad.service"
-	exit 1
+if [[ $? != 0 ]]; then
+    echo "Failed to start asus_touchpad_numpad.service"
+    exit 1
 else
-	echo "Asus touchpad service started"
+    echo "ASUS touchpad service started"
 fi
 
+echo "Installation complete for ASUS Zenbook 14 UX3405MA"
 exit 0
 
