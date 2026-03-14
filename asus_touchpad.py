@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -283,17 +284,174 @@ def deactivate_numlock():
     subprocess.call(numpad_cmd)
 
 
-def launch_calculator():
-    # Try to open a calculator app if available; fall back to the KEY_CALC keycode.
-    for cmd in ("gnome-calculator", "kcalc", "galculator", "xcalc"):
-        if shutil.which(cmd):
-            try:
-                subprocess.Popen([cmd])
-                return
-            except OSError:
+def _find_desktop_user():
+    # Prefer active graphical sessions reported by logind.
+    if shutil.which("loginctl"):
+        try:
+            sessions = subprocess.check_output(
+                ["loginctl", "list-sessions", "--no-legend", "--no-pager"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in sessions.splitlines():
+                parts = line.split()
+                if len(parts) < 1:
+                    continue
+                session_id = parts[0]
+                details = subprocess.check_output(
+                    [
+                        "loginctl", "show-session", session_id,
+                        "-p", "Active", "-p", "State", "-p", "Type", "-p", "Name",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                props = {}
+                for row in details.splitlines():
+                    if "=" in row:
+                        key, value = row.split("=", 1)
+                        props[key] = value
+                if props.get("Active") != "yes":
+                    continue
+                if props.get("State") != "active":
+                    continue
+                session_type = props.get("Type")
+                if session_type not in ("x11", "wayland"):
+                    continue
+                name = props.get("Name")
+                if not name:
+                    continue
+                uid = pwd.getpwnam(name).pw_uid
+                if uid == 0:
+                    continue
+                display = props.get("Display", "")
+                return name, uid, session_type, display
+        except (subprocess.CalledProcessError, KeyError, OSError):
+            pass
+
+    # Fallback: first non-root runtime bus in /run/user.
+    try:
+        for entry in sorted(os.listdir("/run/user")):
+            if not entry.isdigit():
                 continue
+            uid = int(entry)
+            if uid == 0:
+                continue
+            bus = f"/run/user/{uid}/bus"
+            if os.path.exists(bus):
+                return pwd.getpwuid(uid).pw_name, uid, "", ""
+    except (OSError, KeyError):
+        pass
+
+    return None
+
+
+def _find_x_display():
+    try:
+        sockets = sorted(name for name in os.listdir("/tmp/.X11-unix") if name.startswith("X"))
+        if sockets:
+            return ":" + sockets[0][1:]
+    except OSError:
+        pass
+    return None
+
+
+def _find_wayland_display(runtime_dir):
+    try:
+        sockets = sorted(name for name in os.listdir(runtime_dir) if name.startswith("wayland-"))
+        if sockets:
+            return sockets[0]
+    except OSError:
+        pass
+    return None
+
+
+def _launch_as_user(cmd, username, uid, session_type, display):
+    runtime_dir = f"/run/user/{uid}"
+    if not os.path.isdir(runtime_dir):
+        return False
 
     try:
+        user_home = pwd.getpwnam(username).pw_dir
+    except KeyError:
+        user_home = f"/home/{username}"
+
+    env_pairs = [
+        f"HOME={user_home}",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
+    ]
+    if session_type == "wayland":
+        wayland_display = _find_wayland_display(runtime_dir)
+        if wayland_display:
+            env_pairs.append(f"WAYLAND_DISPLAY={wayland_display}")
+    if display:
+        env_pairs.append(f"DISPLAY={display}")
+    else:
+        x_display = _find_x_display()
+        if x_display:
+            env_pairs.append(f"DISPLAY={x_display}")
+
+    launcher = shutil.which("runuser")
+    if launcher:
+        wrapped_cmd = [launcher, "-u", username, "--", "env"] + env_pairs + [cmd]
+    elif shutil.which("sudo"):
+        wrapped_cmd = ["sudo", "-u", username, "env"] + env_pairs + [cmd]
+    else:
+        return False
+
+    try:
+        process = subprocess.Popen(
+            wrapped_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sleep(0.2)
+        launched = process.poll() is None
+        if not launched:
+            log.warning("Calculator command '%s' exited immediately for user %s", cmd, username)
+        return launched
+    except OSError:
+        log.warning("Failed to spawn calculator command '%s' for user %s", cmd, username)
+        return False
+
+
+def launch_calculator():
+    # Try desktop-specific calculator binaries first.
+    calculator_cmds = ("kcalc", "gnome-calculator", "galculator", "xcalc")
+
+    # If running under a normal user session, launch directly.
+    has_gui_session = bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    )
+    if has_gui_session:
+        for cmd in calculator_cmds:
+            if shutil.which(cmd):
+                try:
+                    process = subprocess.Popen([cmd])
+                    sleep(0.15)
+                    if process.poll() is None:
+                        log.info("Launched calculator command '%s' in current session", cmd)
+                        return
+                except OSError:
+                    continue
+
+    # If this is a root service, launch calculator in active desktop user's session.
+    if os.geteuid() == 0:
+        user_info = _find_desktop_user()
+        if user_info:
+            username, uid, session_type, display = user_info
+            for cmd in calculator_cmds:
+                if shutil.which(cmd) and _launch_as_user(cmd, username, uid, session_type, display):
+                    log.info("Launched calculator command '%s' for desktop user %s", cmd, username)
+                    return
+        else:
+            log.warning("No active desktop user session detected for calculator launch")
+
+    try:
+        log.info("Falling back to KEY_CALC virtual key event")
         events = [
             InputEvent(calculator_key, 1),
             InputEvent(EV_SYN.SYN_REPORT, 0),

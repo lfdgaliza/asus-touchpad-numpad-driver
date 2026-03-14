@@ -64,6 +64,9 @@ echo "Installing ASUS touchpad numpad service..."
 # Install service file
 cp asus_touchpad.service /etc/systemd/system/asus_touchpad_numpad.service
 
+# Reload unit files so updates to the service are applied
+systemctl daemon-reload
+
 # Create directories
 mkdir -p /usr/share/asus_touchpad_numpad-driver
 mkdir -p /var/log/asus_touchpad_numpad-driver
